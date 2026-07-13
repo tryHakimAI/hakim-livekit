@@ -1,0 +1,7 @@
+# Third-party frameworks only — no `hakim` / `@hakim/voice` dependency.
+# Those SDKs are not published yet, so this integration speaks Hakim's
+# public REST/WebSocket API directly (see hakim_livekit/_common.py).
+livekit-agents>=1.0
+websockets>=12.0
+aiohttp>=3.9
+python-dotenv>=1.0
