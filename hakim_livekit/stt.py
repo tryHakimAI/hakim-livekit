@@ -207,6 +207,11 @@ class HakimSpeechStream(stt.SpeechStream):
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.input_sample_rate)
         self._opts = opts
         self._api_key = api_key
+        # `_send_task` and `_recv_task` start concurrently — see the matching
+        # note on `HakimSynthesizeStream._session_ready` in tts.py. Gating
+        # the first audio frame on `session.created` avoids feeding audio
+        # into a session whose upstream connection isn't up yet.
+        self._session_ready = asyncio.Event()
 
     async def _run(self) -> None:
         url = resolve_ws_url(
@@ -243,6 +248,10 @@ class HakimSpeechStream(stt.SpeechStream):
             raise APIConnectionError(str(e)) from e
 
     async def _send_task(self, ws: websockets.WebSocketClientProtocol) -> None:
+        # Wait for the session handshake to complete before streaming any
+        # audio — see `_session_ready` in __init__.
+        await self._session_ready.wait()
+
         # Hakim recommends 50-250ms chunks; LiveKit delivers ~10-20ms
         # frames, so re-buffer into ~100ms frames before sending — one
         # WS text message per 100ms instead of one per 10-20ms frame.
@@ -280,7 +289,10 @@ class HakimSpeechStream(stt.SpeechStream):
             event = json.loads(raw)
             etype = event.get("type")
 
-            if etype in ("session.created", None):
+            if etype == "session.created":
+                self._session_ready.set()
+                continue
+            if etype is None:
                 continue
 
             if etype == "transcription.delta":

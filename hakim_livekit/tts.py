@@ -236,11 +236,36 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
         self._pending_utterances = 0
         self._input_closed = False
         self._ended = False
+        # `_input_task` and `_recv_task` start concurrently — nothing
+        # otherwise stops `_input_task` from firing `speech.create` before
+        # `_recv_task` has observed `session.created`. The proxy's upstream
+        # GPU connection comes up asynchronously after the WS upgrade (see
+        # tts-realtime-proxy.ts's handshake note); a `speech.create` that
+        # wins that race gets accepted and billed but produces no audio
+        # (`speech.done` arrives with `duration_ms: 0`, no `speech.started`,
+        # no binary frames at all — confirmed via a live capture). Gating
+        # the first send on this event closes the race.
+        self._session_ready = asyncio.Event()
+        # Set once `_input_closed` AND every sent utterance's `speech.done`
+        # has actually arrived (mirrors `_maybe_end_input`'s own condition).
+        # `_input_task` must wait on this before sending `session.close` —
+        # for a short single-utterance reply, the input channel closes
+        # almost immediately after the one `speech.create` goes out, so
+        # without this wait `session.close` reaches the server while the
+        # utterance is still mid-synthesis. The server treats that as an
+        # abort: it bills the request but the socket closes before
+        # `speech.started`/audio/`speech.done` ever go out — this was the
+        # actual, 100%-reproducible cause of "no audio frames were pushed",
+        # confirmed via a live capture (this bug, not the session_ready race
+        # above, was the primary one — that race is real but secondary).
+        self._all_utterances_done = asyncio.Event()
 
     def _maybe_end_input(self, output_emitter: tts.AudioEmitter) -> None:
-        if self._input_closed and self._pending_utterances <= 0 and not self._ended:
-            self._ended = True
-            output_emitter.end_input()
+        if self._input_closed and self._pending_utterances <= 0:
+            if not self._ended:
+                self._ended = True
+                output_emitter.end_input()
+            self._all_utterances_done.set()
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         output_emitter.initialize(
@@ -275,6 +300,10 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
             raise APIConnectionError(str(e)) from e
 
     async def _input_task(self, ws: websockets.WebSocketClientProtocol, output_emitter: tts.AudioEmitter) -> None:
+        # Wait for the session handshake to complete before sending the
+        # first utterance — see the note on `_session_ready` in __init__.
+        await self._session_ready.wait()
+
         pending: list[str] = []
         async for data in self._input_ch:
             if isinstance(data, self._FlushSentinel):
@@ -295,6 +324,10 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
             pending.append(data)
         self._input_closed = True
         self._maybe_end_input(output_emitter)
+        # Don't tell the server to close until every utterance we sent has
+        # actually finished (speech.done received) — see the note on
+        # `_all_utterances_done` in __init__.
+        await self._all_utterances_done.wait()
         await ws.send(json.dumps({"type": "session.close"}))
 
     async def _recv_task(self, ws: websockets.WebSocketClientProtocol, output_emitter: tts.AudioEmitter) -> None:
@@ -306,7 +339,10 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
             event = json.loads(raw)
             etype = event.get("type")
 
-            if etype in ("session.created", "session.usage", None):
+            if etype == "session.created":
+                self._session_ready.set()
+                continue
+            elif etype in ("session.usage", None):
                 continue
             elif etype == "speech.started":
                 output_emitter.start_segment(segment_id=event.get("request_id") or utils.shortuuid())
