@@ -40,6 +40,10 @@ from ._common import HakimStreamError, Region, auth_headers, resolve_api_key, re
 # AgentSession pipeline was configured for.
 SAMPLE_RATE = 24000
 DEFAULT_MODEL = "hakim-fast-v1"
+# Recycle a pooled WS connection after this long regardless of use, so a
+# single socket doesn't stay pinned open for an entire (potentially very
+# long) conversation. Matches livekit-agents' own inference TTS default.
+_MAX_SESSION_DURATION = 300
 
 
 @dataclass
@@ -101,6 +105,13 @@ class HakimTTS(tts.TTS):
             base_url=base_url if is_given(base_url) else None,
         )
         self._session = http_session
+        # Reused across turns so a fresh TCP/TLS/WS-upgrade handshake isn't
+        # paid on every single utterance — see HakimSynthesizeStream._run().
+        self._pool = utils.ConnectionPool[websockets.ClientConnection](
+            connect_cb=self._connect_ws,
+            close_cb=self._close_ws,
+            max_session_duration=_MAX_SESSION_DURATION,
+        )
 
     @property
     def provider(self) -> str:
@@ -114,6 +125,25 @@ class HakimTTS(tts.TTS):
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
+
+    async def _connect_ws(self, timeout: float) -> websockets.ClientConnection:
+        url = resolve_ws_url("/v1/audio/speech/stream", region=self._opts.region, base_url=self._opts.base_url)
+        return await asyncio.wait_for(
+            websockets.connect(url, additional_headers=auth_headers(self._api_key)),
+            timeout,
+        )
+
+    async def _close_ws(self, ws: websockets.ClientConnection) -> None:
+        try:
+            await ws.send(json.dumps({"type": "session.close"}))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        await ws.close()
+
+    def prewarm(self) -> None:
+        """Open a pooled connection ahead of the first turn. LiveKit's
+        `AgentSession` calls this automatically at session start."""
+        self._pool.prewarm()
 
     def synthesize(
         self,
@@ -140,6 +170,7 @@ class HakimTTS(tts.TTS):
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.close()
+        await self._pool.aclose()
 
 
 class HakimChunkedStream(tts.ChunkedStream):
@@ -276,9 +307,24 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
             stream=True,
         )
 
-        url = resolve_ws_url("/v1/audio/speech/stream", region=self._opts.region, base_url=self._opts.base_url)
         try:
-            async with websockets.connect(url, additional_headers=auth_headers(self._api_key)) as ws:
+            async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
+                self._acquire_time = self._tts._pool.last_acquire_time
+                self._connection_reused = self._tts._pool.last_connection_reused
+
+                # Resent on every turn even when the underlying socket is
+                # reused from the pool — cheap (one message on an
+                # already-open connection) and keeps per-turn option
+                # overrides correct, unlike skipping it entirely. NOTE:
+                # the server only ever emits `session.created` once, right
+                # after the WS upgrade (see tts-realtime-proxy.ts's
+                # emitSessionCreated — it has exactly one call site, at
+                # initial connect; `session.update` never re-triggers it).
+                # A reused connection has already seen that ack in a
+                # previous turn, so don't wait for a second one that will
+                # never arrive — that hung every reused turn forever,
+                # silently dropping it (confirmed live: "need to speak
+                # twice for the LLM to reply").
                 session_update: dict[str, object] = {
                     "model": self._opts.model,
                     "voice": self._opts.voice,
@@ -287,19 +333,37 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
                 if self._opts.voice_prompt:
                     session_update["voice_prompt"] = self._opts.voice_prompt
                 await ws.send(json.dumps({"type": "session.update", "session": session_update}))
+                if self._connection_reused:
+                    self._session_ready.set()
 
                 input_task = asyncio.create_task(self._input_task(ws, output_emitter), name="hakim-tts-input")
                 recv_task = asyncio.create_task(self._recv_task(ws, output_emitter), name="hakim-tts-recv")
                 try:
-                    await asyncio.gather(input_task, recv_task)
+                    # `input_task` is the authoritative "this turn is done"
+                    # signal (it returns only after `_all_utterances_done`
+                    # fires, including the zero-utterance/empty-turn case).
+                    # `recv_task` normally never finishes on its own — it's
+                    # cancelled below once `input_task` completes. Racing on
+                    # FIRST_COMPLETED (rather than gather) means a `recv_task`
+                    # error surfaces immediately instead of only after
+                    # `input_task` also happens to unblock.
+                    done, _pending = await asyncio.wait(
+                        [input_task, recv_task], return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
                 finally:
                     await utils.aio.gracefully_cancel(input_task, recv_task)
         except websockets.exceptions.InvalidStatus as e:
             raise APIStatusError(f"Hakim TTS upgrade rejected: {e}") from e
         except (websockets.exceptions.ConnectionClosed, OSError) as e:
             raise APIConnectionError(str(e)) from e
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError() from e
 
-    async def _input_task(self, ws: websockets.WebSocketClientProtocol, output_emitter: tts.AudioEmitter) -> None:
+    async def _input_task(self, ws: websockets.ClientConnection, output_emitter: tts.AudioEmitter) -> None:
         # Wait for the session handshake to complete before sending the
         # first utterance — see the note on `_session_ready` in __init__.
         await self._session_ready.wait()
@@ -311,6 +375,7 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
                 pending = []
                 if text:
                     self._pending_utterances += 1
+                    self._mark_started()
                     await ws.send(
                         json.dumps(
                             {
@@ -324,13 +389,15 @@ class HakimSynthesizeStream(tts.SynthesizeStream):
             pending.append(data)
         self._input_closed = True
         self._maybe_end_input(output_emitter)
-        # Don't tell the server to close until every utterance we sent has
-        # actually finished (speech.done received) — see the note on
-        # `_all_utterances_done` in __init__.
+        # Wait for every utterance we sent to actually finish (speech.done
+        # received) before returning — see `_all_utterances_done` in
+        # __init__. Deliberately does NOT send session.close: the
+        # connection goes back to the pool for the next turn to reuse.
+        # session.close is only ever sent from `_close_ws`, when the pool
+        # itself decides to actually tear a connection down.
         await self._all_utterances_done.wait()
-        await ws.send(json.dumps({"type": "session.close"}))
 
-    async def _recv_task(self, ws: websockets.WebSocketClientProtocol, output_emitter: tts.AudioEmitter) -> None:
+    async def _recv_task(self, ws: websockets.ClientConnection, output_emitter: tts.AudioEmitter) -> None:
         async for raw in ws:
             if isinstance(raw, (bytes, bytearray)):
                 output_emitter.push(raw)

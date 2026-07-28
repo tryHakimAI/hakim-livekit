@@ -37,6 +37,9 @@ from livekit.agents.utils import AudioBuffer, is_given
 from ._common import HakimStreamError, Region, auth_headers, resolve_api_key, resolve_http_url, resolve_ws_url
 
 STT_MODEL = "hakim-arab-v2"
+# Recycle a pooled WS connection after this long regardless of use — mirrors
+# the same constant in tts.py / livekit-agents' own inference TTS default.
+_MAX_SESSION_DURATION = 300
 
 
 @dataclass
@@ -114,6 +117,13 @@ class HakimSTT(stt.STT):
             base_url=base_url if is_given(base_url) else None,
         )
         self._session = http_session
+        # Reused across turns so a fresh TCP/TLS/WS-upgrade handshake isn't
+        # paid on every single utterance — see HakimSpeechStream._run().
+        self._pool = utils.ConnectionPool[websockets.ClientConnection](
+            connect_cb=self._connect_ws,
+            close_cb=self._close_ws,
+            max_session_duration=_MAX_SESSION_DURATION,
+        )
 
     @property
     def provider(self) -> str:
@@ -127,6 +137,27 @@ class HakimSTT(stt.STT):
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
+
+    async def _connect_ws(self, timeout: float) -> websockets.ClientConnection:
+        url = resolve_ws_url(
+            "/v1/audio/transcriptions/stream", region=self._opts.region, base_url=self._opts.base_url
+        )
+        return await asyncio.wait_for(
+            websockets.connect(url, additional_headers=auth_headers(self._api_key)),
+            timeout,
+        )
+
+    async def _close_ws(self, ws: websockets.ClientConnection) -> None:
+        try:
+            await ws.send(json.dumps({"type": "session.close"}))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        await ws.close()
+
+    def prewarm(self) -> None:
+        """Open a pooled connection ahead of the first turn. LiveKit's
+        `AgentSession` calls this automatically at session start."""
+        self._pool.prewarm()
 
     async def _recognize_impl(
         self,
@@ -193,6 +224,7 @@ class HakimSTT(stt.STT):
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.close()
+        await self._pool.aclose()
 
 
 class HakimSpeechStream(stt.SpeechStream):
@@ -212,13 +244,41 @@ class HakimSpeechStream(stt.SpeechStream):
         # the first audio frame on `session.created` avoids feeding audio
         # into a session whose upstream connection isn't up yet.
         self._session_ready = asyncio.Event()
+        # Hakim's commit/transcription.done is one discrete request per
+        # commit window (mirrors HakimSynthesizeStream's per-utterance
+        # speech.create/speech.done) — track how many commits are still
+        # outstanding so `_recv_task` knows precisely when this stream's
+        # work is done, instead of relying on the socket being closed.
+        self._pending_commits = 0
+        self._input_closed = False
+        self._ended = False
+        self._all_commits_done = asyncio.Event()
+
+    def _maybe_finish(self) -> None:
+        if self._input_closed and self._pending_commits <= 0:
+            self._ended = True
+            self._all_commits_done.set()
 
     async def _run(self) -> None:
-        url = resolve_ws_url(
-            "/v1/audio/transcriptions/stream", region=self._opts.region, base_url=self._opts.base_url
-        )
         try:
-            async with websockets.connect(url, additional_headers=auth_headers(self._api_key)) as ws:
+            async with self._stt._pool.connection(timeout=self._conn_options.timeout) as ws:
+                connection_reused = self._stt._pool.last_connection_reused
+                self._report_connection_acquired(self._stt._pool.last_acquire_time, connection_reused)
+
+                # Resent on every turn even when the underlying socket is
+                # reused from the pool — cheap (one message on an
+                # already-open connection) and keeps per-stream `language`
+                # overrides (HakimSTT.stream(language=...)) correct, unlike
+                # skipping it entirely on a reused connection. NOTE: the
+                # server only ever emits `session.created` once, right
+                # after the WS upgrade (see stt-realtime-proxy.ts's
+                # emitSessionCreated — it has exactly one call site, at
+                # initial connect; `session.update` never re-triggers it).
+                # A reused connection has already seen that ack in a
+                # previous turn, so don't wait for a second one that will
+                # never arrive — that hung every reused turn forever,
+                # silently dropping it (confirmed live: "need to speak
+                # twice for the LLM to reply").
                 await ws.send(
                     json.dumps(
                         {
@@ -235,19 +295,37 @@ class HakimSpeechStream(stt.SpeechStream):
                         }
                     )
                 )
+                if connection_reused:
+                    self._session_ready.set()
 
                 send_task = asyncio.create_task(self._send_task(ws), name="hakim-stt-send")
                 recv_task = asyncio.create_task(self._recv_task(ws), name="hakim-stt-recv")
                 try:
-                    await asyncio.gather(send_task, recv_task)
+                    # `send_task` is the authoritative "this turn is done"
+                    # signal (it returns only after `_all_commits_done`
+                    # fires, including the zero-commit/empty-turn case).
+                    # `recv_task` normally never finishes on its own — it's
+                    # cancelled below once `send_task` completes. Racing on
+                    # FIRST_COMPLETED (rather than gather) means a
+                    # `recv_task` error surfaces immediately instead of only
+                    # after `send_task` also happens to unblock.
+                    done, _pending = await asyncio.wait(
+                        [send_task, recv_task], return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
                 finally:
                     await utils.aio.gracefully_cancel(send_task, recv_task)
         except websockets.exceptions.InvalidStatus as e:
             raise APIStatusError(f"Hakim STT upgrade rejected: {e}") from e
         except (websockets.exceptions.ConnectionClosed, OSError) as e:
             raise APIConnectionError(str(e)) from e
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError() from e
 
-    async def _send_task(self, ws: websockets.WebSocketClientProtocol) -> None:
+    async def _send_task(self, ws: websockets.ClientConnection) -> None:
         # Wait for the session handshake to complete before streaming any
         # audio — see `_session_ready` in __init__.
         await self._session_ready.wait()
@@ -276,15 +354,25 @@ class HakimSpeechStream(stt.SpeechStream):
             if isinstance(data, self._FlushSentinel):
                 for frame in audio_bstream.flush():
                     await _send_frame(frame)
+                self._pending_commits += 1
                 await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                 continue
 
             frame: rtc.AudioFrame = data
             for out_frame in audio_bstream.write(frame.data.tobytes()):
                 await _send_frame(out_frame)
-        await ws.send(json.dumps({"type": "session.close"}))
 
-    async def _recv_task(self, ws: websockets.WebSocketClientProtocol) -> None:
+        self._input_closed = True
+        self._maybe_finish()
+        # Wait for every commit we sent to actually finish
+        # (transcription.done received) before returning — see
+        # `_all_commits_done` in __init__. Deliberately does NOT send
+        # session.close: the connection goes back to the pool for the next
+        # turn to reuse. session.close is only ever sent from `_close_ws`,
+        # when the pool itself decides to actually tear a connection down.
+        await self._all_commits_done.wait()
+
+    async def _recv_task(self, ws: websockets.ClientConnection) -> None:
         async for raw in ws:
             event = json.loads(raw)
             etype = event.get("type")
@@ -317,6 +405,10 @@ class HakimSpeechStream(stt.SpeechStream):
                         ],
                     )
                 )
+                self._pending_commits -= 1
+                self._maybe_finish()
+                if self._ended:
+                    return
             elif etype == "error":
                 code = event.get("code", "unknown_error")
                 message = event.get("message", "")

@@ -50,14 +50,14 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=ctx.proc.userdata["vad"],
         stt=HakimSTT(
             language="ar",
-            region=os.environ.get("HAKIM_REGION", "auto"),
+            region=os.environ.get("HAKIMREGION", "auto"),
         ),
         # Swap for any LLM plugin — Hakim doesn't provide one.
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=HakimTTS(
             voice=os.environ["HAKIM_VOICE"],
             model="hakim-fast-v1",
-            region=os.environ.get("HAKIM_REGION", "auto"),
+            region=os.environ.get("HAKIMREGION", "auto"),
         ),
     )
 
