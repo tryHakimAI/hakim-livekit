@@ -8,8 +8,12 @@ Wire contract implemented here:
   - Client -> server: `session.update`, `input_audio_buffer.append`,
     `input_audio_buffer.commit`, `session.close`.
   - Server -> client: `session.created`, `transcription.delta`
-    (`is_final: false`), `transcription.done` (final text for the commit
-    window), `error`.
+    (append-only finalized text; with `session.interim` also `tentative:
+    true` frames that replace the live tail), `transcription.done` (exactly
+    one per utterance), `error`.
+  - LiveKit events emitted per utterance: `START_OF_SPEECH` on the first
+    text, cumulative `INTERIM_TRANSCRIPT`, then `FINAL_TRANSCRIPT` followed
+    by `END_OF_SPEECH`.
   - Model is pinned to `hakim-arab-v2` — the only accepted value today.
 """
 
@@ -289,6 +293,10 @@ class HakimSpeechStream(stt.SpeechStream):
                                 "timestamps": self._opts.timestamps,
                                 "diarize": self._opts.diarize,
                                 "partials": self._opts.partials,
+                                # Live tentative partials (ignored by servers that
+                                # don't know it — they keep sending append-only
+                                # fragments, which this plugin also handles).
+                                "interim": self._opts.partials,
                                 "input_audio_format": self._opts.input_audio_format,
                                 "input_sample_rate": self._opts.input_sample_rate,
                             },
@@ -373,6 +381,28 @@ class HakimSpeechStream(stt.SpeechStream):
         await self._all_commits_done.wait()
 
     async def _recv_task(self, ws: websockets.ClientConnection) -> None:
+        # Deltas are either append-only finalized text, or (when the server honours
+        # `interim`) tentative frames flagged `tentative: true` that REPLACE the
+        # current tail. LiveKit wants cumulative interim text plus explicit speech
+        # boundaries, so derive both here. Servers that never send `tentative`
+        # behave exactly as before. The server sends exactly one
+        # `transcription.done` per utterance, which closes the utterance.
+        speaking = False
+        finalized = ""
+        tail = ""
+
+        def _emit(
+            event_type: stt.SpeechEventType,
+            text: str | None = None,
+            language: str | None = None,
+        ) -> None:
+            alternatives = (
+                [stt.SpeechData(language=language or self._opts.language, text=text)]
+                if text is not None
+                else []
+            )
+            self._event_ch.send_nowait(stt.SpeechEvent(type=event_type, alternatives=alternatives))
+
         async for raw in ws:
             event = json.loads(raw)
             etype = event.get("type")
@@ -385,26 +415,36 @@ class HakimSpeechStream(stt.SpeechStream):
 
             if etype == "transcription.delta":
                 text = event.get("text", "")
-                if not text:
+                tentative = event.get("tentative") is True
+                if not text and not tentative:
                     continue
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(
-                        type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                        alternatives=[stt.SpeechData(language=self._opts.language, text=text)],
-                    )
-                )
+                if tentative:
+                    tail = text
+                else:
+                    finalized += text
+                    tail = ""
+                cumulative = finalized + tail
+                if not cumulative:
+                    continue
+                if not speaking:
+                    speaking = True
+                    _emit(stt.SpeechEventType.START_OF_SPEECH)
+                _emit(stt.SpeechEventType.INTERIM_TRANSCRIPT, cumulative)
             elif etype == "transcription.done":
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(
-                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                        alternatives=[
-                            stt.SpeechData(
-                                language=event.get("language", self._opts.language),
-                                text=event.get("text", ""),
-                            )
-                        ],
-                    )
+                done_text = event.get("text", "")
+                if not speaking and done_text:
+                    speaking = True
+                    _emit(stt.SpeechEventType.START_OF_SPEECH)
+                _emit(
+                    stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    done_text,
+                    event.get("language", self._opts.language),
                 )
+                if speaking:
+                    _emit(stt.SpeechEventType.END_OF_SPEECH)
+                speaking = False
+                finalized = ""
+                tail = ""
                 self._pending_commits -= 1
                 self._maybe_finish()
                 if self._ended:

@@ -120,7 +120,7 @@ constructor to override it.
 | `language`           | `"ar"`           | Per-call override via `stream(language=...)`.                                                  |
 | `timestamps`         | `"segment"`      | `"word" \| "segment" \| "none"`.                                                               |
 | `diarize`            | `False`          | Stereo call-recording use case only (see §6).                                                  |
-| `partials`           | `True`           | Emit `INTERIM_TRANSCRIPT` events.                                                              |
+| `partials`           | `True`           | Emit live, cumulative `INTERIM_TRANSCRIPT` events (the plugin opts in to tentative partials). Also emits `START_OF_SPEECH` on the first text of an utterance and `END_OF_SPEECH` right after each `FINAL_TRANSCRIPT`. |
 | `input_audio_format` | `"pcm16"`        | `"pcm16" \| "opus" \| "mulaw"` — matches LiveKit's native frame format, no transcoding needed. |
 | `input_sample_rate`  | `16000`          | Must match the sample rate of frames actually pushed.                                          |
 | `region`             | `"auto"`         | `"auto" \| "de" \| "uae" \| "ksa"`.                                                            |
