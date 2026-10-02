@@ -118,6 +118,7 @@ constructor to override it.
 | -------------------- | ---------------- | ---------------------------------------------------------------------------------------------- |
 | `api_key`            | `$HAKIM_API_KEY` |                                                                                                |
 | `language`           | `"ar"`           | Per-call override via `stream(language=...)`.                                                  |
+| `language_hints`     | `None`           | Several languages for mixed-language speech, e.g. `["ar", "en"]`. When set it takes precedence over `language` (which can stay as is or be `"auto"`). Omit for single-language behaviour. |
 | `timestamps`         | `"segment"`      | `"word" \| "segment" \| "none"`.                                                               |
 | `diarize`            | `False`          | Stereo call-recording use case only (see §6).                                                  |
 | `partials`           | `True`           | Emit live, cumulative `INTERIM_TRANSCRIPT` events (the plugin opts in to tentative partials). Also emits `START_OF_SPEECH` on the first text of an utterance and `END_OF_SPEECH` right after each `FINAL_TRANSCRIPT`. |

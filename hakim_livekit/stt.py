@@ -56,6 +56,8 @@ class _STTOptions:
     input_sample_rate: int
     region: Region
     base_url: str | None
+    # Languages the audio may contain (code-switching). Wins over `language` server-side.
+    language_hints: list[str] | None = None
 
 
 class HakimSTT(stt.STT):
@@ -69,6 +71,7 @@ class HakimSTT(stt.STT):
         *,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         language: str = "ar",
+        language_hints: list[str] | None = None,
         timestamps: str = "segment",
         diarize: bool = False,
         partials: bool = True,
@@ -84,6 +87,11 @@ class HakimSTT(stt.STT):
                 `HAKIM_API_KEY` env var.
             language: BCP-47-ish language hint (`"ar"`, `"en"`, ...). Pass
                 per-call overrides via `stream(language=...)`.
+            language_hints: Several languages the audio may contain, for
+                mixed-language / code-switching speech (e.g. `["ar", "en"]`).
+                Optional; when set it takes precedence over `language`
+                server-side (so `language` can stay as is, or be `"auto"`).
+                Omit it for the previous single-language behaviour.
             timestamps: `"word" | "segment" | "none"`.
             diarize: Speaker diarization (stereo call-recording use case;
                 mono diarization is not yet supported).
@@ -112,6 +120,7 @@ class HakimSTT(stt.STT):
         self._api_key = resolve_api_key(api_key if is_given(api_key) else None)
         self._opts = _STTOptions(
             language=language,
+            language_hints=list(language_hints) if language_hints else None,
             timestamps=timestamps,
             diarize=diarize,
             partials=partials,
@@ -263,6 +272,26 @@ class HakimSpeechStream(stt.SpeechStream):
             self._ended = True
             self._all_commits_done.set()
 
+    def _session_update_frame(self) -> dict:
+        """The `session.update` frame sent at the start of every turn."""
+        session: dict = {
+            "model": STT_MODEL,
+            "language": self._opts.language,
+            "timestamps": self._opts.timestamps,
+            "diarize": self._opts.diarize,
+            "partials": self._opts.partials,
+            # Live tentative partials (ignored by servers that don't know it —
+            # they keep sending append-only fragments, which this plugin also
+            # handles).
+            "interim": self._opts.partials,
+            "input_audio_format": self._opts.input_audio_format,
+            "input_sample_rate": self._opts.input_sample_rate,
+        }
+        # Only sent when set, so single-language sessions are byte-for-byte unchanged.
+        if self._opts.language_hints:
+            session["language_hints"] = self._opts.language_hints
+        return {"type": "session.update", "session": session}
+
     async def _run(self) -> None:
         try:
             async with self._stt._pool.connection(timeout=self._conn_options.timeout) as ws:
@@ -283,26 +312,7 @@ class HakimSpeechStream(stt.SpeechStream):
                 # never arrive — that hung every reused turn forever,
                 # silently dropping it (confirmed live: "need to speak
                 # twice for the LLM to reply").
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "session.update",
-                            "session": {
-                                "model": STT_MODEL,
-                                "language": self._opts.language,
-                                "timestamps": self._opts.timestamps,
-                                "diarize": self._opts.diarize,
-                                "partials": self._opts.partials,
-                                # Live tentative partials (ignored by servers that
-                                # don't know it — they keep sending append-only
-                                # fragments, which this plugin also handles).
-                                "interim": self._opts.partials,
-                                "input_audio_format": self._opts.input_audio_format,
-                                "input_sample_rate": self._opts.input_sample_rate,
-                            },
-                        }
-                    )
-                )
+                await ws.send(json.dumps(self._session_update_frame()))
                 if connection_reused:
                     self._session_ready.set()
 
