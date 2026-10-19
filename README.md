@@ -137,7 +137,7 @@ endpoint accepts.
 | `voice`        | _(required)_      | Hakim voice id or slug — Dashboard → Voices.              |
 | `api_key`      | `$HAKIM_API_KEY`  |                                                           |
 | `model`        | `"hakim-fast-v1"` | `"hakim-fast-v1"` (sub-120ms TTFB)                        |
-| `cfg`          | `3.0`             | Classifier-free-guidance weight, `0.0`–`10.0`.            |
+| `cfg`          | `2.0`             | Classifier-free-guidance weight, `0.0`–`10.0` (API default); above ~2.5 the voice gets louder and can clip. |
 | `voice_prompt` | `None`            | Free-form voice description; only honoured on `hakim-v3`. |
 | `region`       | `"auto"`          | Same as above.                                            |
 | `base_url`     | —                 | Same as above.                                            |
