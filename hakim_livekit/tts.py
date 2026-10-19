@@ -68,7 +68,7 @@ class HakimTTS(tts.TTS):
         voice: str,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         model: str = DEFAULT_MODEL,
-        cfg: float = 3.0,
+        cfg: float = 2.0,
         voice_prompt: str | None = None,
         region: Region = "auto",
         base_url: NotGivenOr[str] = NOT_GIVEN,
@@ -83,7 +83,9 @@ class HakimTTS(tts.TTS):
             model: `"hakim-fast-v1"` (default, sub-120ms TTFB), `"hakim-v2"`
                 (higher quality + non-verbal tags), or `"hakim-v3"`
                 (adds free-form `voice_prompt` control).
-            cfg: Classifier-free-guidance weight, `0.0`-`10.0` (default `3.0`).
+            cfg: Classifier-free-guidance weight, `0.0`-`10.0` (default `2.0`,
+                the API default). Values above ~2.5 make the voice noticeably
+                louder and can clip.
             voice_prompt: Free-form voice-character description, only
                 honoured on `model="hakim-v3"` — dropped elsewhere.
             region: `"auto" | "de" | "uae" | "ksa"`.
